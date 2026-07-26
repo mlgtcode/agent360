@@ -24,6 +24,7 @@ from __future__ import print_function, unicode_literals
 
 import json
 import os
+import re
 import subprocess
 
 import plugins
@@ -79,6 +80,26 @@ class Plugin(plugins.BasePlugin):
                 return raw_value.decode('utf-8', 'replace')
         return raw_value or ''
 
+    @staticmethod
+    def _extract_json_text(text):
+        if not text:
+            return None
+
+        start = text.find('{')
+        end = text.rfind('}')
+        if start == -1 or end == -1 or end < start:
+            return None
+
+        return text[start:end + 1]
+
+    @staticmethod
+    def _sanitize_json_text(text):
+        if not text:
+            return text
+
+        # rspamc may emit non-JSON float tokens such as lowercase nan/inf.
+        return re.sub(r'(?<![A-Za-z0-9_"])(nan|inf|-inf)(?![A-Za-z0-9_"])', 'null', text, flags=re.IGNORECASE)
+
     def _run_json(self, cmd):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         stdout_raw, stderr_raw = proc.communicate()
@@ -88,10 +109,16 @@ class Plugin(plugins.BasePlugin):
         if proc.returncode != 0:
             return None, 'command failed (%s): %s' % (proc.returncode, stderr or stdout)
 
+        json_text = self._extract_json_text(stdout)
+        if not json_text:
+            return None, 'rspamc returned no JSON payload'
+
+        json_text = self._sanitize_json_text(json_text)
+
         try:
-            payload = json.loads(stdout)
+            payload = json.loads(json_text)
         except Exception:
-            return None, 'invalid JSON from rspamc'
+            return None, 'invalid JSON from rspamc: %s' % stdout[:200]
         return payload, None
 
     @staticmethod
@@ -161,37 +188,39 @@ class Plugin(plugins.BasePlugin):
         no_action_count = self._as_int(actions.get('no action', (uptime or {}).get('clean', 0)))
 
         result = {
-            # Basic health and lifecycle state.
-            'available': 1,
-            'auth_ok': 1 if (uptime or {}).get('auth') == 'ok' else 0,
-            'read_only': 1 if bool((stat or {}).get('read_only', (uptime or {}).get('read_only', False))) else 0,
-            'version': (stat or {}).get('version', (uptime or {}).get('version', 'unknown')),
-            'uptime_seconds': self._as_int((stat or {}).get('uptime', (uptime or {}).get('uptime', 0))),
-            # Throughput and classification totals.
-            'scanned': scanned,
-            'learned': learned,
-            'spam_count': spam_count,
-            'ham_count': ham_count,
-            # Action counters most useful for mail-flow monitoring.
-            'reject_count': reject_count,
-            'soft_reject_count': soft_reject_count,
-            'greylist_count': greylist_count,
-            'add_header_count': add_header_count,
-            'rewrite_subject_count': rewrite_subject_count,
-            'no_action_count': no_action_count,
-            # Ratios for alerting without shipping heavy raw details.
-            'spam_ratio_pct': self._pct(spam_count, scanned),
-            'reject_ratio_pct': self._pct(reject_count, scanned),
-            'greylist_ratio_pct': self._pct(greylist_count, scanned),
-            # Latency signal from rspamc stat JSON.
-            'scan_time_avg_sec': self._avg((stat or {}).get('scan_times', [])),
-            'scan_time_last_sec': self._as_float((stat or {}).get('scan_time', (uptime or {}).get('scan_time', 0.0)), 0.0),
+            'meta': {
+                'version': (stat or {}).get('version', (uptime or {}).get('version', 'unknown')),
+            },
+            'health': {
+                'available': 1,
+                'auth_ok': 1 if (uptime or {}).get('auth') == 'ok' else 0,
+                'read_only': 1 if bool((stat or {}).get('read_only', (uptime or {}).get('read_only', False))) else 0,
+                'uptime_seconds': self._as_int((stat or {}).get('uptime', (uptime or {}).get('uptime', 0))),
+                'stat_ok': 0 if stat_error else 1,
+                'uptime_ok': 0 if uptime_error else 1,
+            },
+            'messages': {
+                'scanned': scanned,
+                'learned': learned,
+                'spam_count': spam_count,
+                'ham_count': ham_count,
+                'spam_ratio_pct': self._pct(spam_count, scanned),
+            },
+            'actions': {
+                'reject_count': reject_count,
+                'soft_reject_count': soft_reject_count,
+                'greylist_count': greylist_count,
+                'add_header_count': add_header_count,
+                'rewrite_subject_count': rewrite_subject_count,
+                'no_action_count': no_action_count,
+                'reject_ratio_pct': self._pct(reject_count, scanned),
+                'greylist_ratio_pct': self._pct(greylist_count, scanned),
+            },
+            'performance': {
+                'scan_time_avg_sec': self._avg((stat or {}).get('scan_times', [])),
+                'scan_time_last_sec': self._as_float((stat or {}).get('scan_time', (uptime or {}).get('scan_time', 0.0)), 0.0),
+            },
         }
-
-        if stat_error:
-            result['stat_warning'] = stat_error
-        if uptime_error:
-            result['uptime_warning'] = uptime_error
 
         return result
 
